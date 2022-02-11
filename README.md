@@ -5,6 +5,15 @@
 CLIP (Contrastive Language-Image Pre-Training) is a neural network trained on a variety of (image, text) pairs. It can be instructed in natural language to predict the most relevant text snippet, given an image, without directly optimizing for the task, similarly to the zero-shot capabilities of GPT-2 and 3. We found CLIP matches the performance of the original ResNet50 on ImageNet “zero-shot” without using any of the original 1.28M labeled examples, overcoming several major challenges in computer vision.
 
 
+## Patched adding fp16 option for LayerNorm (Added by aredden)
+
+You can load models like this:
+
+```python
+import torch
+from clip import clip
+model, preproccess = clip.load("ViT-B/32", float_dtype=torch.float16)
+```
 
 ## Approach
 
@@ -44,7 +53,6 @@ with torch.no_grad():
 
 print("Label probs:", probs)  # prints: [[0.9927937  0.00421068 0.00299572]]
 ```
-
 
 ## API
 

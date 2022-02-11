@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn import LayerNorm as _LayerNorm
 
 
 class Bottleneck(nn.Module):
@@ -150,12 +151,15 @@ class ModifiedResNet(nn.Module):
         return x
 
 
-class LayerNorm(nn.LayerNorm):
+class LayerNorm(_LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
+    def __init__(self, *args, float_dtype=torch.float32, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._float_dtype = float_dtype
 
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
-        ret = super().forward(x.type(torch.float32))
+        ret = super().forward(x.type(self._float_dtype))
         return ret.type(orig_type)
 
 
@@ -165,17 +169,19 @@ class QuickGELU(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, float_dtype: torch.dtype = torch.float32):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(d_model, n_head)
-        self.ln_1 = LayerNorm(d_model)
+        # Patch for dtype
+        self.ln_1 = LayerNorm(d_model, float_dtype=float_dtype)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
             ("gelu", QuickGELU()),
             ("c_proj", nn.Linear(d_model * 4, d_model))
         ]))
-        self.ln_2 = LayerNorm(d_model)
+        # Patch for dtype
+        self.ln_2 = LayerNorm(d_model, float_dtype=float_dtype)
         self.attn_mask = attn_mask
 
     def attention(self, x: torch.Tensor):
@@ -189,18 +195,19 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
+    def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, float_dtype: torch.dtype = torch.float32):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        # Patch for dtype
+        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask, float_dtype=float_dtype) for _ in range(layers)])
 
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, float_dtype: torch.dtype = torch.float32):
         super().__init__()
         self.input_resolution = input_resolution
         self.output_dim = output_dim
@@ -209,11 +216,14 @@ class VisionTransformer(nn.Module):
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
-        self.ln_pre = LayerNorm(width)
+        
+        # patch for dtype
+        self.ln_pre = LayerNorm(width, float_dtype=float_dtype)
+        # patch for dtype
+        self.transformer = Transformer(width, layers, heads, float_dtype=float_dtype)
+        # patch for dtype
+        self.ln_post = LayerNorm(width, float_dtype=float_dtype)
 
-        self.transformer = Transformer(width, layers, heads)
-
-        self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor):
@@ -249,7 +259,8 @@ class CLIP(nn.Module):
                  vocab_size: int,
                  transformer_width: int,
                  transformer_heads: int,
-                 transformer_layers: int
+                 transformer_layers: int,
+                 float_dtype: torch.dtype = torch.float32
                  ):
         super().__init__()
 
@@ -272,20 +283,26 @@ class CLIP(nn.Module):
                 width=vision_width,
                 layers=vision_layers,
                 heads=vision_heads,
-                output_dim=embed_dim
+                output_dim=embed_dim,
+                # Patch for dtype
+                float_dtype=float_dtype
             )
 
         self.transformer = Transformer(
             width=transformer_width,
             layers=transformer_layers,
             heads=transformer_heads,
-            attn_mask=self.build_attention_mask()
+            attn_mask=self.build_attention_mask(),
+            # Patch for dtype
+            float_dtype=float_dtype
         )
 
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
-        self.ln_final = LayerNorm(transformer_width)
+        
+        # patch for dtype
+        self.ln_final = LayerNorm(transformer_width, float_dtype=float_dtype)
 
         self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
@@ -392,7 +409,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict):
+def build_model(state_dict: dict, float_dtype=torch.float32):
     vit = "visual.proj" in state_dict
 
     if vit:
@@ -417,10 +434,13 @@ def build_model(state_dict: dict):
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith(f"transformer.resblocks")))
 
+
+    # patch for dtype
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
+        context_length, vocab_size, transformer_width, transformer_heads, 
+        transformer_layers, float_dtype=float_dtype
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
